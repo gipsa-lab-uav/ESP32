@@ -32,8 +32,11 @@
 #include "db_esp32_comm.h"
 #include "db_protocol.h"
 
+#define STA_MAXIMUM_RETRY 3
+
 EventGroupHandle_t wifi_event_group;
 static const char *TAG = "DB_ESP32";
+static int s_retry_num = 0;
 
 uint8_t DEFAULT_SSID[32] = "DroneBridge ESP32";
 uint8_t DEFAULT_PWD[64] = "dronebridge";
@@ -45,11 +48,16 @@ uint32_t DB_UART_BAUD_RATE = 115200;
 uint16_t TRANSPARENT_BUF_SIZE = 64;
 uint8_t LTM_FRAME_NUM_BUFFER = 1;
 
+void init_wifi_ap();
+void init_wifi_sta();
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     wifi_event_ap_staconnected_t *event;
     wifi_event_ap_stadisconnected_t* evente;
-    switch (event_id) {
+    if(event_base==WIFI_EVENT)
+    {
+	switch (event_id) {
         case SYSTEM_EVENT_AP_START:
             ESP_LOGI(TAG, "Wifi AP started!");
             xEventGroupSetBits(wifi_event_group, BIT2);
@@ -66,8 +74,32 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
             ESP_LOGI(TAG, "Client disconnected - station:"MACSTR", AID=%d",
                      MAC2STR(evente->mac), evente->aid);
             break;
+        case WIFI_EVENT_STA_START:
+            esp_wifi_connect();
+            break;
+        case WIFI_EVENT_STA_DISCONNECTED:
+	    if (s_retry_num < STA_MAXIMUM_RETRY) {
+		esp_wifi_connect();
+		s_retry_num++;
+		ESP_LOGI(TAG, "retry to connect to the AP");
+	    } else {
+		xEventGroupSetBits(wifi_event_group, BIT1);
+		ESP_LOGI(TAG,"connect to the AP fail");
+	    }
+	    break;
+
         default:
             break;
+	}
+    }
+    else if(event_base==IP_EVENT && event_id==IP_EVENT_STA_GOT_IP)
+    {
+	s_retry_num = 0;
+	ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+	ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+	//ESP_ERROR_CHECK(tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA, &event->ip_info));
+	//ESP_ERROR_CHECK(tcpip_adapter_sta_start(TCPIP_ADAPTER_IF_STA, &event->ip_info));
+	xEventGroupSetBits(wifi_event_group, BIT0|BIT2);
     }
 }
 
@@ -90,15 +122,9 @@ void start_mdns_service()
 }
 
 
-void init_wifi(){
-    wifi_event_group = xEventGroupCreate();
-    tcpip_adapter_init();
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+void init_wifi_ap()
+{
+    /* AP MODE */
     wifi_config_t ap_config = {
             .ap = {
                     .ssid = "Init DroneBridge ESP32",
@@ -110,6 +136,7 @@ void init_wifi(){
                     .max_connection = 10
             },
     };
+
     xthal_memcpy(ap_config.ap.ssid, DEFAULT_SSID, 32);
     xthal_memcpy(ap_config.ap.password, DEFAULT_PWD, 64);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
@@ -127,6 +154,58 @@ void init_wifi(){
     IP4_ADDR(&ip_info.netmask, 255,255,255,0);
     ESP_ERROR_CHECK(tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_AP, &ip_info));
     ESP_ERROR_CHECK(tcpip_adapter_dhcps_start(TCPIP_ADAPTER_IF_AP));
+
+}
+
+void init_wifi_sta()
+{
+    /* STATION Mode */
+    wifi_config_t sta_config = {
+        .sta = {
+            .ssid = "Init DroneBridge ESP32",
+            .password = "dronebridge",
+            /* Setting a password implies station will connect to all security modes including WEP/WPA.
+             * However these modes are deprecated and not advisable to be used. Incase your Access point
+             * doesn't support WPA2, these mode can be enabled by commenting below line */
+	     .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+
+        },
+    };
+    xthal_memcpy(sta_config.sta.ssid, DEFAULT_SSID, 32);
+    xthal_memcpy(sta_config.sta.password, DEFAULT_PWD, 64);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &sta_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+    
+}
+
+
+void init_wifi(){
+    wifi_event_group = xEventGroupCreate();
+    tcpip_adapter_init();
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    
+    init_wifi_sta();
+    
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+					   BIT0 | BIT1,
+					   pdFALSE,
+					   pdFALSE,
+					   portMAX_DELAY);
+    if (bits & BIT1)
+    {
+	ESP_LOGI(TAG, "Start AP");
+
+	init_wifi_ap();
+    }
 }
 
 
